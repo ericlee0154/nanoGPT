@@ -22,6 +22,7 @@ import math
 import pickle
 from contextlib import nullcontext
 
+import platform
 import numpy as np
 import torch
 from torch.nn.parallel import DistributedDataParallel as DDP
@@ -44,12 +45,14 @@ wandb_log = False # disabled by default
 wandb_project = 'owt'
 wandb_run_name = 'gpt2' # 'run' + str(time.time())
 # data
-dataset = 'openwebtext'
+# NEED TO CHANGE THIS
+# dataset = 'openwebtext' # 'openwebtext' or 'shakespeare_char'
+dataset = 'shakespeare_char'
 gradient_accumulation_steps = 5 * 8 # used to simulate larger batch sizes
-batch_size = 12 # if gradient_accumulation_steps > 1, this is the micro-batch size
-block_size = 1024
+batch_size = 8 # if gradient_accumulation_steps > 1, this is the micro-batch size
+block_size = 64
 # model
-n_layer = 12
+n_layer = 6
 n_head = 12
 n_embd = 768
 dropout = 0.0 # for pretraining 0 is good, for finetuning try 0.1+
@@ -69,14 +72,35 @@ min_lr = 6e-5 # minimum learning rate, should be ~= learning_rate/10 per Chinchi
 # DDP settings
 backend = 'nccl' # 'nccl', 'gloo', etc.
 # system
-device = 'cuda' # examples: 'cpu', 'cuda', 'cuda:0', 'cuda:1' etc., or try 'mps' on macbooks
+def get_best_device():
+    system = platform.system()
+
+    if system == "Darwin":  # macOS
+        if torch.backends.mps.is_available():
+            print("✅ MPS is available.")
+            return torch.device("mps")
+        else:
+            print("⚠️ MPS not available. Falling back to CPU.")
+            return torch.device("cpu")
+    
+    elif torch.cuda.is_available():
+        # 這裡安全地設置第一張 GPU 為預設
+        torch.cuda.set_device(0)
+        return torch.device("cuda")
+    
+    else:
+        return torch.device("cpu")
+# -----------------------------------------------------------------------------
+device = get_best_device() # examples: 'cpu', 'cuda', 'cuda:0', 'cuda:1' etc., or try 'mps' on macbooks
 dtype = 'bfloat16' if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else 'float16' # 'float32', 'bfloat16', or 'float16', the latter will auto implement a GradScaler
 compile = True # use PyTorch 2.0 to compile the model to be faster
 # -----------------------------------------------------------------------------
 config_keys = [k for k,v in globals().items() if not k.startswith('_') and isinstance(v, (int, float, bool, str))]
-exec(open('configurator.py').read()) # overrides from command line or config file
+dir_path = os.path.abspath(os.path.dirname(__file__)) # path to this file location
+exec(open(os.path.join(dir_path,'configurator.py')).read()) # overrides from command line or config file
 config = {k: globals()[k] for k in config_keys} # will be useful for logging
 # -----------------------------------------------------------------------------
+
 
 # various inits, derived attributes, I/O setup
 ddp = int(os.environ.get('RANK', -1)) != -1 # is this a ddp run?
@@ -85,8 +109,8 @@ if ddp:
     ddp_rank = int(os.environ['RANK'])
     ddp_local_rank = int(os.environ['LOCAL_RANK'])
     ddp_world_size = int(os.environ['WORLD_SIZE'])
-    device = f'cuda:{ddp_local_rank}'
-    torch.cuda.set_device(device)
+    # device = f'cuda:{ddp_local_rank}'
+    device = get_best_device()
     master_process = ddp_rank == 0 # this process will do logging, checkpointing etc.
     seed_offset = ddp_rank # each process gets a different seed
     # world_size number of processes will be training simultaneously, so we can scale
@@ -106,13 +130,13 @@ if master_process:
 torch.manual_seed(1337 + seed_offset)
 torch.backends.cuda.matmul.allow_tf32 = True # allow tf32 on matmul
 torch.backends.cudnn.allow_tf32 = True # allow tf32 on cudnn
-device_type = 'cuda' if 'cuda' in device else 'cpu' # for later use in torch.autocast
+device_type = device.type # for later use in torch.autocast
 # note: float16 data type will automatically use a GradScaler
 ptdtype = {'float32': torch.float32, 'bfloat16': torch.bfloat16, 'float16': torch.float16}[dtype]
 ctx = nullcontext() if device_type == 'cpu' else torch.amp.autocast(device_type=device_type, dtype=ptdtype)
 
 # poor man's data loader
-data_dir = os.path.join('data', dataset)
+data_dir = os.path.join(dir_path,os.path.join('data', dataset))
 def get_batch(split):
     # We recreate np.memmap every batch to avoid a memory leak, as per
     # https://stackoverflow.com/questions/45132940/numpy-memmap-memory-usage-want-to-iterate-once/61472122#61472122
@@ -193,7 +217,9 @@ if block_size < model.config.block_size:
 model.to(device)
 
 # initialize a GradScaler. If enabled=False scaler is a no-op
-scaler = torch.cuda.amp.GradScaler(enabled=(dtype == 'float16'))
+# scaler = torch.cuda.amp.GradScaler('cuda',enabled=(dtype == 'float16'))
+from torch.amp import GradScaler
+scaler = GradScaler(enabled=(device.type == 'cuda' and dtype == 'float16'))
 
 # optimizer
 optimizer = model.configure_optimizers(weight_decay, learning_rate, (beta1, beta2), device_type)
@@ -205,7 +231,7 @@ checkpoint = None # free up memory
 if compile:
     print("compiling the model... (takes a ~minute)")
     unoptimized_model = model
-    model = torch.compile(model) # requires PyTorch 2.0
+    # model = torch.compile(model, backend="eager") # requires PyTorch 2.0
 
 # wrap model into DDP container
 if ddp:
@@ -320,7 +346,8 @@ while True:
     if iter_num % log_interval == 0 and master_process:
         # get loss as float. note: this is a CPU-GPU sync point
         # scale up to undo the division above, approximating the true total loss (exact would have been a sum)
-        lossf = loss.item() * gradient_accumulation_steps
+        # lossf = loss.item() * gradient_accumulation_steps
+        lossf = loss.detach().item() * gradient_accumulation_steps
         if local_iter_num >= 5: # let the training loop settle a bit
             mfu = raw_model.estimate_mfu(batch_size * gradient_accumulation_steps, dt)
             running_mfu = mfu if running_mfu == -1.0 else 0.9*running_mfu + 0.1*mfu

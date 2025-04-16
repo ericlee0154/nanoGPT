@@ -61,7 +61,7 @@ optimizer = model.configure_optimizers(weight_decay=1e-2, learning_rate=1e-4, be
 
 if compile:
     print("Compiling model...")
-    model = torch.compile(model) # pytorch 2.0
+    model = torch.compile(model, backend="eager") # pytorch 2.0
 
 if profile:
     # useful docs on pytorch profiler:

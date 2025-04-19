@@ -33,13 +33,13 @@ from model import GPTConfig, GPT
 # -----------------------------------------------------------------------------
 # default config values designed to train a gpt2 (124M) on OpenWebText
 # I/O
-out_dir = 'out'
-eval_interval = 2000
+out_dir = 'checkpoints' # output directory
+eval_interval = 200 # 100
 log_interval = 1
 eval_iters = 200
 eval_only = False # if True, script exits right after the first eval
 always_save_checkpoint = True # if True, always save a checkpoint after each eval
-init_from = 'scratch' # 'scratch' or 'resume' or 'gpt2*'
+init_from = 'resume' # 'scratch' or 'resume' or 'gpt2*'
 # wandb logging
 wandb_log = False # disabled by default
 wandb_project = 'owt'
@@ -47,15 +47,15 @@ wandb_run_name = 'gpt2' # 'run' + str(time.time())
 # data
 # NEED TO CHANGE THIS
 # dataset = 'openwebtext' # 'openwebtext' or 'shakespeare_char'
-dataset = 'shakespeare_char'
-gradient_accumulation_steps = 5 * 8 # used to simulate larger batch sizes
-batch_size = 8 # if gradient_accumulation_steps > 1, this is the micro-batch size
-block_size = 64
+dataset = 'openwebtext'
+gradient_accumulation_steps = 4 # used to simulate larger batch sizes
+batch_size = 4 # if gradient_accumulation_steps > 1, this is the micro-batch size
+block_size = 1024
 # model
-n_layer = 6
-n_head = 12
-n_embd = 768
-dropout = 0.0 # for pretraining 0 is good, for finetuning try 0.1+
+n_layer = 4
+n_head = 4
+n_embd = 256
+dropout = 0.1 # for pretraining 0 is good, for finetuning try 0.1+
 bias = False # do we use bias inside LayerNorm and Linear layers?
 # adamw optimizer
 learning_rate = 6e-4 # max learning rate
@@ -84,7 +84,6 @@ def get_best_device():
             return torch.device("cpu")
     
     elif torch.cuda.is_available():
-        # 這裡安全地設置第一張 GPU 為預設
         torch.cuda.set_device(0)
         return torch.device("cuda")
     
@@ -93,7 +92,7 @@ def get_best_device():
 # -----------------------------------------------------------------------------
 device = get_best_device() # examples: 'cpu', 'cuda', 'cuda:0', 'cuda:1' etc., or try 'mps' on macbooks
 dtype = 'bfloat16' if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else 'float16' # 'float32', 'bfloat16', or 'float16', the latter will auto implement a GradScaler
-compile = True # use PyTorch 2.0 to compile the model to be faster
+compile = False # use PyTorch 2.0 to compile the model to be faster
 # -----------------------------------------------------------------------------
 config_keys = [k for k,v in globals().items() if not k.startswith('_') and isinstance(v, (int, float, bool, str))]
 dir_path = os.path.abspath(os.path.dirname(__file__)) # path to this file location
@@ -153,6 +152,7 @@ def get_batch(split):
     else:
         x, y = x.to(device), y.to(device)
     return x, y
+
 
 # init these up here, can override if init_from='resume' (i.e. from a checkpoint)
 iter_num = 0
@@ -231,7 +231,7 @@ checkpoint = None # free up memory
 if compile:
     print("compiling the model... (takes a ~minute)")
     unoptimized_model = model
-    # model = torch.compile(model, backend="eager") # requires PyTorch 2.0
+    model = torch.compile(model, backend="eager") # requires PyTorch 2.0
 
 # wrap model into DDP container
 if ddp:
